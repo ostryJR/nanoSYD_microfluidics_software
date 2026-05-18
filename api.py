@@ -28,6 +28,13 @@ class Hub:
         comm = f"/_{command}{"R" if execute else ""}\r"
         self.serial.write(comm)
         
+    def read_response(self):
+        try:
+            response = self.serial.readAll()
+            return response
+        except serial.SerialException as e:
+            print(f"Error reading from serial connection: {e}")
+            return None
         
     #not implemented
     # def send_command_two_pumps():
@@ -40,6 +47,7 @@ class Hub:
         #NOTES:
         #backlash compensation not implemented yet
         #pump configuration saving in non-volataile memory not implemented yet
+        #handling of valve not implemented yet
         #syringe dead volume not implemented yet
         # non volataile EEPROM memory commands (computer free operation) not implemented yet
         
@@ -108,6 +116,41 @@ class Hub:
         def send_command(self, command, execute=True):
             comm = f'/{self.pump_id}{command}{"R" if execute else ""}\r'
             self.serial.write(comm)
+            
+        # def decompose_reply(reply):
+        #     # print(f"Decomposing reply: {reply}")
+        #     #address = int(reply[1:2].decode()) # not important, always 0
+        #     status = str(chr(reply[2]))
+        #     data = str(reply[3:].decode(errors="ignore"))[:-3]
+        #     return address, status, data
+        
+        def parse_response(raw_response):
+            # Convert bytes to string if needed
+            if isinstance(raw_response, bytes):
+                response_str = raw_response.decode('ascii', errors='ignore')
+                print(f"Decoded response: {response_str}")
+            else:
+                response_str = str(raw_response)
+                print(f"Response is already a string: {response_str}, no need to decode. Delete the if statement")
+                
+            # Clean up standard formatting whitespace/newlines
+            response_str = response_str.strip()
+            
+            # Check for minimal valid structural length (/0 + Status character)
+            if not response_str.startswith('/') or len(response_str) < 3:
+                return None
+
+            # Strip out the ETX (0x03) character if it exists in the string
+            response_str = response_str.replace('\x03', '')
+
+            # Assign directly to variables based on string positions
+            pump_address = response_str[1]       # Typically '0'
+            status_character = response_str[2]   # Raw status byte character
+            
+            # Extract the data portion (ignoring a final trailing checksum byte if present)
+            data_payload = response_str[3:].rstrip() 
+            
+            return pump_address, status_character, data_payload
         
         def calculate_steps(self, volume):
             # volume in microliters
@@ -160,11 +203,21 @@ class Hub:
             self.send_command(f'V{int(speed)}')
         
         def set_cutoff_speed(self, speed=900):
-            # speed 50>>>2700
+            # speed 50...2700
             if speed < 50 or speed > 2700:
                 raise ValueError(f'[ERROR]: Cutoff speed must be between 50 and 2700 steps')
             self.speed_cutoff = int(speed)
             self.send_command(f'c{int(speed)}')
+            
+        def set_constant_speed(self, speed=1400):
+            # speed 5...6000
+            if speed < 5 or speed > 6000:
+                raise ValueError(f'[ERROR]: Constant speed must be between 5 and 6000 steps')
+            self.speed_top = int(speed)
+            self.start_speed = int(speed)
+            self.speed_cutoff = int(speed)
+            self.send_command(f'v{int(speed)}V{int(speed)}c{int(speed)}')
+            
 
         #### CONTROL COMMANDS
         def execute_command(self):
@@ -218,25 +271,23 @@ class Hub:
             # returns absolute position in steps
             self.send_command("?P", execute=False)
             
-            # RESPONSE!!!
-            # response = self.serial.readline().decode().strip()
-            # return int(response)
+            response = self.parse_response(self.read_response())
+            return int(response[2]) if response else None
         
         def get_actual_position(self):
             # returns actual position in steps
             self.send_command("?4", execute=False)
             
-            # RESPONSE!!!
-            # response = self.serial.readline().decode().strip()
-            # return int(response)
+            response = self.parse_response(self.read_response())
+            return int(response[2]) if response else None
         
         def command_buffer_status(self):
-            # returns number of commands in buffer
+            #returns if there is a command in the buffer
+            # response = 1 => there is command in the buffer, response = 0 => there is no command in the buffer
             self.send_command("?10", execute=False)
             
-            # RESPONSE!!!
-            # response = self.serial.readline().decode().strip()
-            # return int(response)
+            response = self.parse_response(self.read_response())
+            return int(response[2]) if response else None
             
             #inf response = 1 => there is command in the buffer, response = 0 => there is no command in the buffer
             
@@ -244,9 +295,8 @@ class Hub:
             # returns status of auxilary input pins (J4 in 7,8)
             self.send_command(("?13" if pin == 1 else "?14"), execute=False)
             
-            # RESPONSE!!!
-            # response = self.serial.readline().decode().strip()
-            # return int(response)
+            response = self.parse_response(self.read_response())
+            return int(response[2]) if response else None
             
             #response = 0 => pin is low, response = 1 => pin is high
         
@@ -254,17 +304,14 @@ class Hub:
             # returns pump configuration
             self.send_command("?76", execute=False)
             
-            # RESPONSE!!!
-            # response = self.serial.readline().decode().strip()
-            # return response
+            response = self.parse_response(self.read_response())
+            return int(response[2]) if response else None
         
         def get_status_errors(self):
             # returns status of the pump and errors
             self.send_command("Q", execute=False)
             
-            # RESPONSE!!!
-            # response = self.serial.readline().decode().strip()
-            # return response
+            response = self.parse_response(self.read_response())
             
             #convert resopnse byte to bits
             # 7 6 5 4 3 2 1 0
@@ -277,19 +324,21 @@ class Hub:
             dict_errors = {0:"No Error", 1:"Initialization Error", 2:"Invalid Command", 3:"Invalid Operand", 4:"Invalid Command Sequence", 6:"EEPROM Failure", 7:"Device Not Initialized", 9:"Plunger Overload", 10:"Valve Overload", 11:"Plunger Move Not Allowed", 15:"Command Overflow"}
             # more info about errors in the manual page 81
             
+            return {"status": "Executing" if response and int(response[2]) & 32 else "Idle", "error": dict_errors.get(int(response[2]) & 15)}
+            
             
         
-class Test:
-    hub = Hub(port="COM3")
+# class Test:
+#     hub = Hub(port="COM3")
     
-    hub.pumps.append(hub.Pump(pump_address=0, syringe_volume=1000))
-    pumps = hub.pumps
+#     hub.pumps.append(hub.Pump(pump_address=0, syringe_volume=1000))
+#     pumps = hub.pumps
     
-    #TEST 1 - test calculate steps function
-    if pumps[0].calculate_steps(1000) == 300:
-        print("[TEST 1]Test passed")
-    else:
-        print("[TEST 1]Test failed")
+#     #TEST 1 - test calculate steps function
+#     if pumps[0].calculate_steps(1000) == 300:
+#         print("[TEST 1]Test passed")
+#     else:
+#         print("[TEST 1]Test failed")
 
 
 if __name__ == "__main__":
